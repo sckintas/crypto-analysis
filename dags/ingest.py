@@ -6,6 +6,7 @@ import logging
 import requests
 
 from airflow import DAG
+from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
@@ -16,11 +17,11 @@ from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQue
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Environmental variables
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
-BUCKET_NAME = os.environ.get("GCP_GCS_BUCKET")
-BQ_DATASET_NAME = os.environ.get("BQ_DATASET_NAME", 'stg_coins_dataset')
-BQ_TABLE_NAME = "bitcoin_history"
+# Retrieve variables from Airflow
+PROJECT_ID = Variable.get("GCP_PROJECT_ID")
+BQ_DATASET_NAME = Variable.get("BQ_DATASET_NAME", default_var='stg_coins_dataset')
+BQ_TABLE_NAME = Variable.get("BQ_TABLE_NAME", default_var='bitcoin_history')
+BUCKET_NAME = Variable.get("BUCKET_NAME")
 
 # API endpoint for Bitcoin minutely history
 BITCOIN_HISTORY_URL = "https://api.coincap.io/v2/assets/bitcoin/history?interval=m1"
@@ -30,18 +31,26 @@ def fetch_and_upload_to_gcs(bucket_name):
     Fetch minutely Bitcoin history data from the API, convert it to Parquet, and upload it directly to GCS.
     """
     try:
+        # Log the bucket name for debugging
+        logger.info(f"Using bucket name: {bucket_name}")
+        if not bucket_name:
+            raise ValueError("Bucket name is not provided or is empty.")
+
         # Fetch data from the API
         logger.info("Fetching Bitcoin minutely history data from the API...")
         response = requests.get(BITCOIN_HISTORY_URL)
         response.raise_for_status()  # Raise an error for bad status codes
         data = response.json()
+        logger.info(f"API response: {data}")
 
         # Convert JSON data to a DataFrame
         df = pd.DataFrame.from_dict(data['data'])
+        logger.info(f"DataFrame created: {df.head()}")
 
         # Add a timestamp for the filename
         current_time = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
         object_name = f"raw/bitcoin_history/bitcoin_history_{current_time}.parquet"
+        logger.info(f"Preparing to upload file: {object_name}")
 
         # Convert DataFrame to Parquet format in memory
         parquet_buffer = df.to_parquet(index=False)
