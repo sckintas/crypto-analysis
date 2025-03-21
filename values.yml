@@ -1,0 +1,10 @@
+dags:
+  gitSync:
+    enabled: true
+    repo: ""  # Empty - provided via --set
+    branch: main
+    subPath: dags
+    depth: 1
+    sshKeySecret: airflow-gke-git-secret
+    knownHosts: "true"
+    knownHostsConfigMap: airflow-ssh-known-hosts
