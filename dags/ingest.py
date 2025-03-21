@@ -18,19 +18,25 @@ from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQue
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Retrieve variables from Airflow
+# Retrieve Airflow variables
 PROJECT_ID = Variable.get("GCP_PROJECT_ID")
 BQ_DATASET_NAME = Variable.get("BQ_DATASET_NAME", default_var='stg_coins_dataset')
 BQ_TABLE_NAME = Variable.get("BQ_TABLE_NAME", default_var='bitcoin_history')
 BUCKET_NAME = Variable.get("BUCKET_NAME")
 
-# API endpoint for Bitcoin minutely history
+# API endpoint
 BITCOIN_HISTORY_URL = "https://api.coincap.io/v2/assets/bitcoin/history?interval=m1"
 
 def fetch_and_upload_to_gcs(bucket_name):
     """
-    Fetch minutely Bitcoin history data from the API, convert it to Parquet, and upload it directly to GCS.
+    Fetch Bitcoin history from API, convert to Parquet, and upload to GCS.
+    Logs the active GSA to confirm Workload Identity.
     """
+    from google.auth import default
+    creds, project = default()
+    logger.info(f"GCP project from creds: {project}")
+    logger.info(f"Active GSA: {getattr(creds, 'service_account_email', 'No email found')}")
+
     try:
         logger.info(f"Using bucket name: {bucket_name}")
         if not bucket_name:
@@ -62,11 +68,12 @@ def fetch_and_upload_to_gcs(bucket_name):
         blob.upload_from_file(buffer, timeout=300)
 
         logger.info(f"Successfully uploaded {object_name} to GCS.")
+
     except Exception as e:
         logger.error(f"Error in fetch_and_upload_to_gcs: {e}")
         raise
 
-# Default arguments for the DAG
+# DAG default args
 afw_default_args = {
     "owner": "airflow",
     "start_date": datetime(2024, 5, 25),
@@ -85,7 +92,6 @@ with DAG(
     tags=['crypto-analytics-afw'],
 ) as dag:
 
-    # Task 1: Fetch Bitcoin data and upload to GCS
     fetch_and_upload_task = PythonOperator(
         task_id="fetch_and_upload_to_gcs",
         python_callable=fetch_and_upload_to_gcs,
@@ -94,7 +100,6 @@ with DAG(
         },
     )
 
-    # Task 2: Load data from GCS to BigQuery
     load_data_to_bq_task = GCSToBigQueryOperator(
         task_id='load_data_to_bq',
         bucket=BUCKET_NAME,
@@ -106,11 +111,10 @@ with DAG(
         create_disposition='CREATE_IF_NEEDED',
     )
 
-    # Task 3: Trigger DBT transformation DAG
     trigger_dbt_dag_task = TriggerDagRunOperator(
         task_id='trigger_dbt_dag',
         trigger_dag_id='transform_data_in_dbt_dag',
     )
 
-    # Define task dependencies
+    # Set task dependencies
     fetch_and_upload_task >> load_data_to_bq_task >> trigger_dbt_dag_task
