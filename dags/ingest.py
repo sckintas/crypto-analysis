@@ -1,23 +1,105 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from datetime import datetime
+import os
+import json
+import pandas as pd
+from datetime import datetime, timedelta
 import logging
+import requests
 
-def log_active_gsa():
-    import google.auth
-    creds, project = google.auth.default()
-    gsa = getattr(creds, 'service_account_email', 'No email found')
-    logging.info(f"✅ GCP project: {project}")
-    logging.info(f"🔥 Active GSA: {gsa}")
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from google.cloud import storage
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Retrieve variables from Airflow
+PROJECT_ID = Variable.get("GCP_PROJECT_ID")
+BQ_DATASET_NAME = Variable.get("BQ_DATASET_NAME", default_var='stg_coins_dataset')
+BQ_TABLE_NAME = Variable.get("BQ_TABLE_NAME", default_var='bitcoin_history')
+BUCKET_NAME = Variable.get("BUCKET_NAME")
+
+# API endpoint for Bitcoin minutely history
+BITCOIN_HISTORY_URL = "https://api.coincap.io/v2/assets/bitcoin/history?interval=m1"
+
+def fetch_and_upload_to_gcs(bucket_name):
+    """
+    Fetch minutely Bitcoin history data from the API, convert it to Parquet, and upload it directly to GCS.
+    """
+    try:
+        logger.info(f"Using bucket name: {bucket_name}")
+        if not bucket_name:
+            raise ValueError("Bucket name is not provided or is empty.")
+
+        logger.info("Fetching Bitcoin minutely history data from the API...")
+        response = requests.get(BITCOIN_HISTORY_URL)
+        response.raise_for_status()
+        data = response.json()
+
+        df = pd.DataFrame.from_dict(data['data'])
+        logger.info(f"DataFrame created with {len(df)} records.")
+
+        current_time = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        object_name = f"raw/bitcoin_history/bitcoin_history_{current_time}.parquet"
+        logger.info(f"Preparing to upload file: {object_name}")
+
+        # Convert to Parquet in memory
+        parquet_buffer = df.to_parquet(index=False)
+
+        # Upload to GCS
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_name)
+        blob.upload_from_string(parquet_buffer, timeout=300)
+
+        logger.info(f"Successfully uploaded {object_name} to GCS.")
+
+    except Exception as e:
+        logger.error(f"Error in fetch_and_upload_to_gcs: {e}")
+        raise
+
+# DAG default args
+afw_default_args = {
+    "owner": "airflow",
+    "start_date": datetime(2024, 5, 25),
+    "depends_on_past": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+# DAG definition
 with DAG(
-    dag_id="debug_gsa_dag",
-    start_date=datetime(2024, 1, 1),
-    schedule_interval=None,
+    dag_id="bitcoin_history_dag",
+    schedule_interval=timedelta(minutes=1),
+    default_args=afw_default_args,
+    max_active_runs=1,
     catchup=False,
-    tags=["debug"],
+    tags=['crypto-analytics-afw'],
 ) as dag:
-    log_gsa = PythonOperator(
-        task_id="log_active_gsa",
-        python_callable=log_active_gsa,
+
+    fetch_and_upload_task = PythonOperator(
+        task_id="fetch_and_upload_to_gcs",
+        python_callable=fetch_and_upload_to_gcs,
+        op_kwargs={"bucket_name": BUCKET_NAME},
     )
+
+    load_data_to_bq_task = GCSToBigQueryOperator(
+        task_id='load_data_to_bq',
+        bucket=BUCKET_NAME,
+        source_objects=["raw/bitcoin_history/bitcoin_history_*.parquet"],
+        source_format='PARQUET',
+        destination_project_dataset_table=f'{PROJECT_ID}.{BQ_DATASET_NAME}.{BQ_TABLE_NAME}',
+        autodetect=True,
+        write_disposition='WRITE_APPEND',
+        create_disposition='CREATE_IF_NEEDED',
+    )
+
+    trigger_dbt_dag_task = TriggerDagRunOperator(
+        task_id='trigger_dbt_dag',
+        trigger_dag_id='transform_data_in_dbt_dag',
+    )
+
+    fetch_and_upload_task >> load_data_to_bq_task >> trigger_dbt_dag_task
