@@ -1,6 +1,7 @@
 import os
 import json
 import pandas as pd
+import io
 from datetime import datetime, timedelta
 import logging
 import requests
@@ -31,43 +32,41 @@ def fetch_and_upload_to_gcs(bucket_name):
     Fetch minutely Bitcoin history data from the API, convert it to Parquet, and upload it directly to GCS.
     """
     try:
-        # Log the bucket name for debugging
         logger.info(f"Using bucket name: {bucket_name}")
         if not bucket_name:
             raise ValueError("Bucket name is not provided or is empty.")
 
-        # Fetch data from the API
         logger.info("Fetching Bitcoin minutely history data from the API...")
         response = requests.get(BITCOIN_HISTORY_URL)
-        response.raise_for_status()  # Raise an error for bad status codes
+        response.raise_for_status()
         data = response.json()
-        logger.info(f"API response: {data}")
 
-        # Convert JSON data to a DataFrame
+        if not data.get("data"):
+            raise ValueError("No data returned from the API.")
+
         df = pd.DataFrame.from_dict(data['data'])
-        logger.info(f"DataFrame created: {df.head()}")
+        logger.info(f"DataFrame created with {len(df)} records.")
 
-        # Add a timestamp for the filename
         current_time = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
         object_name = f"raw/bitcoin_history/bitcoin_history_{current_time}.parquet"
         logger.info(f"Preparing to upload file: {object_name}")
 
-        # Convert DataFrame to Parquet format in memory
-        parquet_buffer = df.to_parquet(index=False)
+        # Convert DataFrame to Parquet in memory
+        buffer = io.BytesIO()
+        df.to_parquet(buffer, index=False)
+        buffer.seek(0)
 
-        # Upload the Parquet file directly to GCS
-        logger.info("Uploading Parquet file to GCS...")
         client = storage.Client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(object_name)
-        blob.upload_from_string(parquet_buffer, timeout=300)
-        logger.info(f"Successfully uploaded {object_name} to GCS.")
+        blob.upload_from_file(buffer, timeout=300)
 
+        logger.info(f"Successfully uploaded {object_name} to GCS.")
     except Exception as e:
         logger.error(f"Error in fetch_and_upload_to_gcs: {e}")
         raise
 
-# Set default arguments
+# Default arguments for the DAG
 afw_default_args = {
     "owner": "airflow",
     "start_date": datetime(2024, 5, 25),
@@ -76,16 +75,17 @@ afw_default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
-# DAG declaration
+# DAG definition
 with DAG(
     dag_id="bitcoin_history_dag",
-    schedule_interval=timedelta(minutes=1),  # Run every minute
+    schedule_interval=timedelta(minutes=1),
     default_args=afw_default_args,
     max_active_runs=1,
     catchup=False,
     tags=['crypto-analytics-afw'],
 ) as dag:
 
+    # Task 1: Fetch Bitcoin data and upload to GCS
     fetch_and_upload_task = PythonOperator(
         task_id="fetch_and_upload_to_gcs",
         python_callable=fetch_and_upload_to_gcs,
@@ -94,21 +94,23 @@ with DAG(
         },
     )
 
+    # Task 2: Load data from GCS to BigQuery
     load_data_to_bq_task = GCSToBigQueryOperator(
         task_id='load_data_to_bq',
         bucket=BUCKET_NAME,
-        source_objects=["raw/bitcoin_history/bitcoin_history_*.parquet"],  # Use a wildcard to match all files
+        source_objects=["raw/bitcoin_history/bitcoin_history_*.parquet"],
         source_format='PARQUET',
         destination_project_dataset_table=f'{PROJECT_ID}.{BQ_DATASET_NAME}.{BQ_TABLE_NAME}',
         autodetect=True,
-        write_disposition='WRITE_APPEND',  # Append new data instead of overwriting
+        write_disposition='WRITE_APPEND',
         create_disposition='CREATE_IF_NEEDED',
     )
 
+    # Task 3: Trigger DBT transformation DAG
     trigger_dbt_dag_task = TriggerDagRunOperator(
         task_id='trigger_dbt_dag',
         trigger_dag_id='transform_data_in_dbt_dag',
     )
 
-    # Task dependencies
+    # Define task dependencies
     fetch_and_upload_task >> load_data_to_bq_task >> trigger_dbt_dag_task
